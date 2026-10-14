@@ -1,0 +1,74 @@
+{
+  "batch": "example-parallel-build",
+  "window": 45,
+  "roots": {
+    "workspace": ["C:/path/to/worktrees/EX-1", "C:/path/to/worktrees/EX-2"],
+    "source": ["C:/path/to/main-checkout"],
+    "allow": [
+      "C:/path/to/worktrees/EX-1",
+      "C:/path/to/worktrees/EX-2",
+      "C:/path/to/evidence/EX"
+    ],
+    "strict": false
+  },
+  "stages": [
+    {
+      "id": "impl",
+      "type": "dispatch_group",
+      "timeout": 5400,
+      "agents": [
+        {
+          "key": "backend",
+          "title": "EX backend engineer",
+          "directory": "C:/path/to/worktrees/EX-1",
+          "prompt_file": "C:/path/to/evidence/EX/prompts/backend.md",
+          "output_file": "C:/path/to/evidence/EX/backend_result.md",
+          "verify": {
+            "files_exist": ["C:/path/to/worktrees/EX-1/src/app/feature.ts"],
+            "files_match": {
+              "C:/path/to/evidence/EX/backend_result.md": "EX_BACKEND_DONE"
+            }
+          }
+        },
+        {
+          "key": "tests",
+          "title": "EX tests engineer",
+          "directory": "C:/path/to/worktrees/EX-2",
+          "prompt_file": "C:/path/to/evidence/EX/prompts/tests.md",
+          "output_file": "C:/path/to/evidence/EX/tests_result.md",
+          "verify": {
+            "files_contain": {
+              "C:/path/to/evidence/EX/tests_result.md": "TR 结论：PASS"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "type": "shell",
+      "steps": [
+        {
+          "argv": ["C:/path/to/git/bin/git.exe", "-C", "C:/path/to/worktrees/EX-1", "diff", "--numstat"],
+          "cwd": "C:/path/to/evidence/EX",
+          "timeout": 120,
+          "retries": 0,
+          "stdout_contains": ["src/app/feature.ts"]
+        },
+        {
+          "argv": ["C:/path/to/python/python.exe", "C:/path/to/run_smoke.py"],
+          "cwd": "C:/path/to/evidence/EX",
+          "timeout": 1800,
+          "retries": 2,
+          "stdout_contains": ["ALL SMOKE PASS"]
+        }
+      ]
+    },
+    {
+      "id": "done",
+      "type": "notify",
+      "title": "EX batch local artifacts ready",
+      "message": "Two engineers finished; local verification passed. Batch stops here (no push)."
+    }
+  ]
+}
