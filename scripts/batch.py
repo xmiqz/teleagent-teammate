@@ -697,44 +697,61 @@ class Batch:
                     self.maybe_realert()
                     time.sleep(15)
                     continue
-                # 默认 escalate-exit：末行 fallback_needed 后立即退出 rc3。
-                # 进程退出是阻塞等待中调用方的唯一可靠唤醒信号（无弹窗、无
-                # 用户）；调用方执行末行 argv 即完成裁决并从断点续跑。
-                esc = self.state.get("escalation") or {}
-                self.emit("BATCH_ESCALATED_EXIT", event="fallback_needed",
-                          escalated_exit=True,
-                          reason=esc.get("reason"), stage=esc.get("stage"),
-                          detail=esc.get("detail"), blocking=True,
-                          recommended_actions=esc.get(
-                              "recommended_actions") or self.escalation_actions(),
-                          state_dir=os.path.abspath(self.sdir),
-                          hint="处置后执行 recommended_actions 的 argv 即续跑；"
-                               "guard 不会重拉 escalated 状态")
-                return 3
+                return self.exit_for_escalation()
 
             try:
                 typ = stage["type"]
                 if typ == "dispatch_group":
                     r = self.run_dispatch_group(stage)
+                    if self._escalated_exit():
+                        continue
                     if r is None:
                         time.sleep(10)
                     elif r is False:
                         time.sleep(15)
                 elif typ == "shell":
                     if self.run_shell(stage) is False:
+                        if self._escalated_exit():
+                            continue
                         time.sleep(15)
                 elif typ == "notify":
                     self.run_notify(stage)
                 else:
                     self.escalate(stage["id"], f"未知阶段类型 {typ}", "")
+                    if self._escalated_exit():
+                        continue
                     time.sleep(15)
             except Exception as e:
                 # TeleAgent 服务抖动/瞬时错误不得杀死进程触发重启循环：
-                # 记日志、退避 60s，状态机原样下一轮重试（sid 已持久化）
+                # 记日志、退避 60s，状态机原样下一轮重试（sid 已持久化）。
+                # 例外：抖动同时已升级（如授权线程上交）-> 立即退出唤醒。
                 self.emit("BATCH_ERROR", stage=stage["id"],
                           error=f"{type(e).__name__}: {e}"[:500])
+                if self._escalated_exit():
+                    continue
                 time.sleep(60)
             time.sleep(3)
+
+    def _escalated_exit(self):
+        """exit 模式下升级已发生：本轮不得再睡，立即到循环顶部退出。"""
+        return (not self.escalate_wait
+                and self.state["status"] == "escalated")
+
+    def exit_for_escalation(self):
+        """默认 escalate-exit：末行 fallback_needed 后立即退出 rc3。进程退出
+        是阻塞等待中调用方的唯一可靠唤醒信号（无弹窗、无用户）；调用方执行
+        末行 argv 即完成裁决并从断点续跑。"""
+        esc = self.state.get("escalation") or {}
+        self.emit("BATCH_ESCALATED_EXIT", event="fallback_needed",
+                  escalated_exit=True,
+                  reason=esc.get("reason"), stage=esc.get("stage"),
+                  detail=esc.get("detail"), blocking=True,
+                  recommended_actions=esc.get(
+                      "recommended_actions") or self.escalation_actions(),
+                  state_dir=os.path.abspath(self.sdir),
+                  hint="处置后执行 recommended_actions 的 argv 即续跑；"
+                       "guard 不会重拉 escalated 状态")
+        return 3
 
 
 def main():

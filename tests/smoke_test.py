@@ -662,9 +662,21 @@ def test_batch_escalate_exit_resolve(wa):
     with open(pb_path, "w", encoding="utf-8") as f:
         json.dump(pb, f, ensure_ascii=False)
 
-    # 缺产物 -> 验证不过 -> 默认 escalate-exit：进程必须退出 rc3 唤醒调用方
+    # 缺产物 -> 验证不过 -> 默认 escalate-exit：进程必须退出 rc3 唤醒调用方。
+    # 时效量的是 ESCALATED -> BATCH_ESCALATED_EXIT 的间隔（进程总时长含
+    # 收割窗节奏，不能用作判据；旧代码这里会白睡 15+3s）。
     rc, lines, out, err = run_batch(wa, pb_path, sdir)
     assert rc == 3, "默认升级即退 rc3：\n%s\n%s" % (out, err)
+    esc = next((e for e in lines if e.get("event") == "fallback_needed"
+                and not e.get("escalated_exit")), None)
+    ex = next((e for e in lines if e.get("escalated_exit")), None)
+    assert esc and ex, "缺升级/退出事件：%s" % [e.get("event") for e in lines]
+
+    def _ts(e):
+        return time.mktime(time.strptime(e["ts"], "%Y-%m-%d %H:%M:%S"))
+
+    gap = _ts(ex) - _ts(esc)
+    assert gap <= 1, "升级后必须同秒退出，不得再睡 15+3s，实际 %ss" % gap
     fb = lines[-1]
     assert fb.get("event") == "fallback_needed" and fb.get("escalated_exit")
     assert "收割验证未过" in fb.get("reason", "")
