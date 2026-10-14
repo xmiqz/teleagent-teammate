@@ -18,6 +18,7 @@
  13. batch 升级即退 rc3（fallback_needed 带 --resolve argv）；
      guard 不重拉 escalated；--resolve retry/skip 断点续跑到 complete；
      --escalate-wait 旧语义升级常驻
+ 14. batch_ctl wait：有界前台等待（rc0/rc3/rc2）与活状态转换即时捕获
 
 直接运行：python smoke_test.py；任一断言失败退出码 1。
 """
@@ -748,6 +749,73 @@ def test_batch_escalate_wait_and_skip(wa):
     print("[ok] --escalate-wait 升级常驻；死进程不被守卫重拉；--resolve skip 续跑 complete")
 
 
+def _ctl(wa, sdir, *a, timeout=30):
+    argv = [PY, os.path.join(SCRIPTS, "batch_ctl.py")]
+    if sdir is not None:
+        argv.append(sdir)
+    p = subprocess.run(argv + list(a),
+                       env=wa.env, capture_output=True, text=True,
+                       timeout=timeout, encoding="utf-8", errors="replace")
+    lines = [json.loads(x) for x in p.stdout.splitlines()
+             if x.strip().startswith("{")]
+    return p.returncode, lines, p.stdout, p.stderr
+
+
+def _write_state(sdir, status, esc=None):
+    os.makedirs(sdir, exist_ok=True)
+    st = {"batch": "ctl-wait-smoke", "status": status}
+    if esc:
+        st["escalation"] = esc
+    with open(os.path.join(sdir, "state.json"), "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False)
+
+
+def test_batch_ctl_wait(wa):
+    sdir = wa.path("ctl-wait")
+    esc = {"stage": "g", "reason": "收割验证未过/缺产物",
+           "recommended_actions": [{"label": "retry", "argv": ["x"]}]}
+
+    # complete -> rc0 末行 wait_terminal
+    _write_state(sdir, "complete")
+    rc, lines, out, err = _ctl(wa, None, "wait", "--state-dir", sdir, "--timeout", "3",
+                               "--interval", "1")
+    assert rc == 0 and lines[-1]["event"] == "wait_terminal", out + err
+
+    # escalated -> rc3，末行必须带 recommended_actions（同轮立即裁决用）
+    _write_state(sdir, "escalated", esc)
+    rc, lines, out, err = _ctl(wa, None, "wait", "--state-dir", sdir, "--timeout", "3",
+                               "--interval", "1")
+    assert rc == 3, out + err
+    assert lines[-1]["recommended_actions"][0]["argv"] == ["x"]
+
+    # running 到点 -> rc2（调用方据此同轮再发一次 wait）
+    _write_state(sdir, "running")
+    t0 = time.time()
+    rc, lines, out, err = _ctl(wa, None, "wait", "--state-dir", sdir, "--timeout", "2",
+                               "--interval", "1")
+    assert rc == 2 and lines[-1]["event"] == "wait_timeout", out + err
+    assert 1.5 < time.time() - t0 < 4
+
+    # 活转换：2s 后状态从 running 变 escalated，wait 必须在同一调用内捕获
+    _write_state(sdir, "running")
+    side = os.path.join(sdir, "flip.json")
+    with open(side, "w", encoding="utf-8") as f:
+        json.dump({"status": "escalated", "escalation": esc}, f)
+    target = os.path.join(sdir, "state.json")
+    flip = ("import json,shutil,time;time.sleep(2);"
+            "shutil.copyfile(%r,%r)" % (side, target))
+    fl = subprocess.Popen([PY, "-c", flip])
+    try:
+        rc, lines, out, err = _ctl(wa, None, "wait", "--state-dir", sdir, "--timeout", "8",
+                                   "--interval", "1")
+        assert rc == 3 and lines[-1]["event"] == "wait_terminal", out + err
+        names = [e["event"] for e in lines]
+        assert names == ["wait_status", "wait_status", "wait_terminal"], names
+    finally:
+        fl.wait(timeout=10)
+    print("[ok] batch_ctl wait：complete rc0 / escalated rc3 带 argv / rc2 续窗 / 活转换即时捕获")
+
+
 def main():
     httpd = serve()
     port = httpd.server_address[1]
@@ -759,6 +827,7 @@ def main():
         test_resume, test_batch_and_guard,
         test_run_stale_busy_done, test_run_abort_blip,
         test_batch_escalate_exit_resolve, test_batch_escalate_wait_and_skip,
+        test_batch_ctl_wait,
     ]
     failed = 0
     for fn in cases:

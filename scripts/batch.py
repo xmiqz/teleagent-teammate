@@ -58,8 +58,9 @@ class Batch:
         self.hb_path = os.path.join(self.sdir, "heartbeat.json")
         self.log_path = os.path.join(self.sdir, "logs", "batch.jsonl")
         self.popup = bool(getattr(args, "popup", False))
-        # 默认 escalate-exit：升级即退 rc3，末行 fallback_needed 唤醒阻塞中的
-        # 调用方（进程退出是唯一可靠唤醒信号）；调用方处置后用 --resolve 重拉。
+        # 默认 escalate-exit：升级的同一次迭代内输出末行 fallback_needed
+        # 后即退 rc3（零额外 sleep），供调用方同轮 batch_ctl wait 循环捕获；
+        # 调用方处置后用 --resolve 重拉。
         # --escalate-wait 保留旧语义（常驻等 batch_ctl，配合 --popup/守卫）。
         self.escalate_wait = bool(getattr(args, "escalate_wait", False))
         self.boot_resolve_action = getattr(args, "resolve", None)

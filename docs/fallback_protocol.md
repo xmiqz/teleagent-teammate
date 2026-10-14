@@ -61,20 +61,29 @@
 
 ## 唤醒协议（反干等）
 
-"工程师做完了、调用方还在干等"的根因是脚本完成/升级后没有东西唤醒
-阻塞中的调用方。本技能的约定：
+"工程师做完了、调用方还在干等"有两个根因：脚本不退出，以及调用方结束
+回合后没有东西能把它拉回。本技能的约定（2026-10-14 双会话真机实测后
+定稿）：
 
-1. **进程退出是唯一可靠的唤醒信号**。调用方必须在同一次工具调用中阻塞
-   等待 run/attach/resume/batch 进程退出，不允许派单后结束回合、sleep
-   轮询或把用户当通知通道。
+1. **同轮有界阻塞是唯一可靠收口**。真机实测：Shell 后台任务的完成通知
+   **不会开启调用方智能体的新一轮对话**——两个后台看守 rc0 退出后，
+   调用方空等 100 秒以上，通知只在下一条用户消息时才一并送达。因此：
+   - 单会话：`run`/`attach` 在当前轮次内前台阻塞；rc2（窗口到点）必须在
+     **同一轮**立即原样再发一次 attach 续窗，可重复；不允许派单后结束
+     回合、sleep 轮询或把用户当通知通道。
+   - 批次：进程后台启动后，同一轮立刻循环前台调用
+     `batch_ctl.py wait --state-dir <dir> --timeout 420`：rc2 立即再 wait，
+     rc3 同一轮执行末行 argv 续跑后再 wait，rc0 才收割。
 2. 单会话看守在一个 tick（默认 5s）内识别终态并退出：done → rc0；
    busy_map 清除滞后（step-finish=stop 但 sid 仍在忙闲表）时连续两次
    相同签名即按 done 收口（事件带 `busy_map_lag: true`）；busy 瞬态
    掉表的单次采样不判 abort，连续两次同签名才 rc3，避免误触发重派。
-3. batch.py 成功 → rc0；**任何阶段升级默认 escalate-exit → rc3**，
-   末行 `fallback_needed`（`escalated_exit: true`，argv 为
+3. batch.py 成功 → rc0；**任何阶段升级默认 escalate-exit → rc3**，且在
+   升级的同一次迭代内退出（零额外 sleep），末行 `fallback_needed`
+   （`escalated_exit: true`，argv 为
    `batch.py --resolve retry|skip|abort|redispatch:<key>` 的重拉命令）。
-   调用方场外处置后执行该 argv，进程应用裁决并从断点续跑。
+   调用方在同轮 wait 循环中拿到 rc3，场外处置后执行该 argv，进程应用
+   裁决并从断点续跑，调用方重新进入 wait。
    `--escalate-wait` 保留"升级常驻 + batch_ctl 指令通道"旧语义。
 4. guard/guard_loop 视 escalated 为 `awaiting_caller`（rc0），**绝不
    重拉**；调用方续跑后心跳恢复，监控自动接续。

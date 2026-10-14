@@ -23,6 +23,22 @@ python scripts/batch.py --playbook playbook.json --state-dir orch/EX
   自动模型故障转移）；
 - Windows 下每个 state-dir 有命名互斥量，重复启动直接退出，不会双开。
 
+## 2.1 同轮等待收口（反干等，必须照做）
+
+批次可以后台启动，但**调用方轮次绝不能就此结束**——2026-10-14 真机实测：
+后台进程退出通知不会开启智能体的新一轮对话，结束本轮 = 干等。启动后
+立刻在**同一轮**前台循环有界等待（rc2 就原样再发一次）：
+
+```
+python scripts/batch_ctl.py wait --state-dir orch/EX --timeout 420
+```
+
+| wait 退出码 | 含义 | 同一轮立即动作 |
+|---|---|---|
+| 0 | wait_terminal：complete/aborted | 收割，进下一步 |
+| 2 | wait_timeout：仍 running | 立即再发一次 wait（可重复），不结束本轮 |
+| 3 | wait_terminal：escalated | 执行末行 argv 的 `--resolve`（见第 4 节），再 wait |
+
 ## 3. 无人值守保活
 
 ```
@@ -41,10 +57,10 @@ python scripts/guard_loop.py --state-dir orch/EX --uninstall-startup
 ## 4. 升级与裁决（调用方智能体通道，不找用户）
 
 阶段超时/验证不过/shell 失败/会话两次中止 → state=escalated。默认
-**escalate-exit**：批次输出末行 `fallback_needed` 后以 rc3 退出，用进程
-退出唤醒阻塞等待中的你（你本来就该在同一次工具调用里阻塞等它）。按末行
-`recommended_actions[].argv` 场外处置后，用 `--resolve` 重拉即裁决+断点
-续跑（sid 已持久化，不重复派单）：
+**escalate-exit**：批次在升级的同一次迭代内输出末行 `fallback_needed`
+后以 rc3 退出（零额外 sleep）；你的同轮 `batch_ctl wait` 循环随即拿到
+rc3。按末行 `recommended_actions[].argv` 场外处置后，用 `--resolve` 重拉
+即裁决+断点续跑（sid 已持久化，不重复派单），然后重新进入 wait：
 
 ```
 # 只重试验证/等待（不重复派单）

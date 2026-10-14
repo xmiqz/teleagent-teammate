@@ -8,9 +8,19 @@
 
 用法：
   python batch_ctl.py status --state-dir <dir>
+  python batch_ctl.py wait   --state-dir <dir> [--timeout 420] [--interval 5]
   python batch_ctl.py retry  --state-dir <dir> [--note "..."]
   python batch_ctl.py skip   --state-dir <dir> [--note "..."]
   python batch_ctl.py abort  --state-dir <dir> [--note "..."]
+
+wait 语义（反干等核心入口，必须在调用方当前轮次内前台阻塞执行）：
+  有界轮询 state.json，单次调用至多阻塞 --timeout 秒；状态变化各输出一行
+  JSON，终态输出末行后退出：
+    complete/aborted -> rc0（末行 wait_terminal）
+    escalated        -> rc3（末行带 escalation.reason/recommended_actions，
+                            调用方在同一轮立即执行 --resolve argv 并再次 wait）
+    到点仍 running   -> rc2（调用方在同一轮立即再发一次 wait，把轮次吊住，
+                            绝不依赖后台任务完成通知——它不会开启新轮次）
 
 指令语义：
   retry  当前升级阶段回到 pending（仅重试验证/等待，不重复派单）；
@@ -90,6 +100,63 @@ def _stale_desc(hb):
         return None
 
 
+def cmd_wait(sdir, timeout, interval):
+    """有界前台阻塞等待批次终态。
+
+    设计依据（真机实测）：Shell 后台任务完成通知不会开启调用方智能体的
+    新一轮对话，进程退出后智能体不会凭空醒来。唯一可靠的收口方式是
+    "当前轮次内的前台阻塞调用"：本函数保证至多阻塞 timeout 秒就把控制权
+    交还给同一轮，rc2 时调用方立即再发一次 wait，形成同轮续窗循环。
+    """
+    deadline = time.time() + timeout
+    last_status = None
+    last_alive = None
+    while True:
+        state = read_json(os.path.join(sdir, "state.json"))
+        if state is None:
+            print(json.dumps({"event": "error",
+                              "detail": f"state.json 不存在：{sdir}"},
+                             ensure_ascii=False))
+            return 3
+        status = state.get("status")
+        hb = read_json(os.path.join(sdir, "heartbeat.json")) or {}
+        pid = hb.get("pid")
+        alive = pid_alive(pid) if pid else False
+        if status != last_status or alive != last_alive:
+            print(json.dumps(
+                {"event": "wait_status", "status": status, "pid": pid,
+                 "alive": alive, "heartbeat_age": _stale_desc(hb)},
+                ensure_ascii=False), flush=True)
+            last_status, last_alive = status, alive
+
+        if status in ("complete", "aborted"):
+            print(json.dumps(
+                {"event": "wait_terminal", "status": status, "rc": 0,
+                 "state_dir": sdir}, ensure_ascii=False), flush=True)
+            return 0
+        if status == "escalated":
+            esc = state.get("escalation") or {}
+            print(json.dumps(
+                {"event": "wait_terminal", "status": "escalated", "rc": 3,
+                 "reason": esc.get("reason"), "stage": esc.get("stage"),
+                 "detail": esc.get("detail"),
+                 "recommended_actions": esc.get("recommended_actions"),
+                 "state_dir": sdir,
+                 "hint": "同一轮内执行 recommended_actions 的 --resolve "
+                         "argv 后，立即再发一次 wait"},
+                ensure_ascii=False), flush=True)
+            return 3
+        if time.time() >= deadline:
+            print(json.dumps(
+                {"event": "wait_timeout", "status": status, "rc": 2,
+                 "state_dir": sdir,
+                 "hint": "批次仍在跑：同一轮内立即再发一次 wait，"
+                         "不要结束本轮、不要转后台等待唤醒"},
+                ensure_ascii=False), flush=True)
+            return 2
+        time.sleep(interval)
+
+
 def send_command(sdir, action, note):
     state = read_json(os.path.join(sdir, "state.json"))
     if state is None:
@@ -137,10 +204,16 @@ def main():
         p.add_argument("--state-dir", required=True)
         if name != "status":
             p.add_argument("--note", default="")
+    pw = sub.add_parser("wait", help="有界前台阻塞等待批次终态（反干等入口）")
+    pw.add_argument("--state-dir", required=True)
+    pw.add_argument("--timeout", type=int, default=420)
+    pw.add_argument("--interval", type=int, default=5)
     args = ap.parse_args()
     sdir = os.path.abspath(args.state_dir)
     if args.action == "status":
         sys.exit(cmd_status(sdir))
+    if args.action == "wait":
+        sys.exit(cmd_wait(sdir, args.timeout, max(1, args.interval)))
     sys.exit(send_command(sdir, args.action, args.note))
 
 

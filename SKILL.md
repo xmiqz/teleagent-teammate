@@ -24,15 +24,24 @@ description: 把编码子任务分包给本机 TeleAgent 智能体并全程无�
 5. 脚本的自动动作只在白名单内（连接退避/自动拉起、401 密钥轮换重试、
    安全授权 session 放行、宽申首次 reject+纠偏、abort 自动重派 1 次）。
    其余一律结构化上交，脚本不替你做危险决策。
-6. **进程退出是唯一可靠的唤醒信号**。派单/批次必须在**同一次工具调用里
-   阻塞等待** run/batch 进程退出（前台超时工具会自动转后台，进程退出时
-   系统自动把你唤醒，无需轮询、无需用户）。严禁裸 dispatch 后结束回合、
-   严禁 sleep 轮询、严禁让用户"等好了叫你"。派给 Task 子智能体时，任务
-   描述必须写明"进程退出前不得结束你的回合"。
+6. **同轮有界阻塞是唯一可靠的收口方式**（2026-10-14 双会话真机实测）。
+   后台任务完成通知**不会开启你的新一轮对话**——实测两个后台看守 rc0 退出
+   后无人唤醒、空等 100 秒以上，通知只在下一条用户消息时才被一并送达。
+   因此工作在途时**绝不能结束当前回合**，正确做法是"短窗口前台调用、同轮
+   立即续"：
+   - 单会话：`run`/`attach` 前台阻塞；rc2（窗口到点，非失败）→ **同一轮**
+     立即原样再发一次 `attach --session <sid>`，可重复，直到 rc0/3/4/6。
+   - 批次：批次进程后台启动后，**同一轮**立刻循环前台调用
+     `batch_ctl.py wait --state-dir <dir> --timeout 420`：rc2 立即再 wait，
+     rc3 同一轮执行末行 `--resolve` argv 后再 wait，rc0 才继续收割。
+   - 严禁：裸 dispatch 后结束回合、把看守/批次丢后台就结束回合、sleep 轮询
+     status、让用户"等好了叫你"。派给 Task 子智能体时，任务描述必须写明
+     "rc2 同轮续窗/再 wait，工作在途不得结束回合"。
 7. **批次升级默认即退**。batch.py 阶段失败时默认输出末行 fallback_needed
-   后以 rc3 退出（就是为了唤醒阻塞中的你），不是崩溃。你场外处置后执行
-   事件 argv（`--resolve retry|skip|abort|redispatch:<key>`）即完成裁决
-   并断点续跑，然后继续阻塞等待。
+   后以 rc3 退出（escalation 同一次迭代内退出，零额外等待），guard 不会
+   重拉 escalated 批次。你在同轮 wait 循环中拿到 rc3 后，执行事件 argv
+   （`--resolve retry|skip|abort|redispatch:<key>`）即完成裁决并断点续跑，
+   然后重新进入 wait 循环。
 
 ## 1. 派单前检查点（30 秒，必做）
 
@@ -80,7 +89,7 @@ python scripts/teammate.py run ^
 | rc | 含义 | 你要做什么 |
 |----|------|-----------|
 | 0 | done，产物就绪 | 读 answer / output-file，进入你的收割/验证 |
-| 2 | timeout（窗口到点，非失败，blocking=false） | 还在推进就执行事件给的 attach 续窗；可重复 |
+| 2 | timeout（窗口到点，非失败，blocking=false） | **同一轮**立即执行事件给的 attach 续窗；可重复，禁止结束本轮等通知 |
 | 3 | session_aborted / model_fault | 执行 resume argv（model_fault 自带 --next-model） |
 | 4 | permission_required | 按第 4 节裁决后执行 reply argv，再 attach |
 | 6 | stalled | 先 prompt 注入推进 + attach；仍停滞则 abort+resume |
@@ -97,8 +106,9 @@ python scripts/teammate.py run ^
 事件结构：`reason`、`blocking`、`context.terminal/held/breakpoint`、
 `recommended_actions[]`（label/argv/effect）、`last_resort`。
 
-- **timeout（rc2）**：不是失败。会话 busy 且签名在增长 → 直接 attach 续窗，
-  不要重派（重派会丢现场）。
+- **timeout（rc2）**：不是失败。会话 busy 且签名在增长 → **同一轮**立即
+  attach 续窗，不要重派（重派会丢现场），也不要结束本轮"等它叫你"
+  （后台完成不会开启新轮次，见第 0 节铁律 6）。
 - **model_fault（rc3）**：供应商创建模型失败/限流/key 失效。第一条 action
   是 `resume --next-model`（自动换凭据就绪的下一供应商）。连续两家都挂 →
   你判断是否降级任务复杂度或自己接手，不要无限换模型。
@@ -180,6 +190,17 @@ PEB 读取，不落盘、不进日志）；重启轮换后自动重发现。`/co
 python scripts/batch.py --playbook playbook.json --state-dir orch\T1
 ```
 
+**收口范式（必须遵守，见第 0 节铁律 6）**：批次进程后台启动后，立刻在
+**同一轮**前台进入有界等待循环——这是唯一可靠收口；后台任务完成不会
+开启你的新一轮：
+
+```
+python scripts/batch_ctl.py wait --state-dir orch\T1 --timeout 420
+```
+
+rc0 终态（complete/aborted，末行 wait_terminal）→ 收割；rc2 到点仍 running
+→ 同一轮立即再发一次 wait（可重复）；rc3 escalated（末行带
+recommended_actions）→ 同一轮执行其中 argv 裁决续跑，再 wait。
 playbook 要点（完整字段见 assets/playbook.example.json）：
 
 - `roots.workspace/source/allow/strict`：全批次统一授权口径。
@@ -192,9 +213,10 @@ playbook 要点（完整字段见 assets/playbook.example.json）：
   会话 abort 自动重派 1 次（自动模型故障转移）；API 抖动 catch-all
   退避 60s 不崩。
 - 升级：阶段失败/超时/验证不过/两次中止 → state=escalated。**默认
-  escalate-exit**：批次输出末行 `fallback_needed`（含可直接执行的
-  `recommended_actions`）后以 **rc3 退出**，专门用来唤醒阻塞等待中的你；
-  你场外处置后执行事件 argv 即裁决+断点续跑，随后继续阻塞等待：
+  escalate-exit**：批次在升级的同一次迭代内输出末行 `fallback_needed`
+  （含可直接执行的 `recommended_actions`）后以 **rc3 退出**（零额外等待，
+  非崩溃），你的同轮 wait 循环随即拿到 rc3；场外处置执行事件 argv 即裁决
+  +断点续跑，然后重新进入 wait 循环：
   - `... batch.py --playbook pb.json --state-dir orch\T1 --resolve retry`
     （只重试验证/等待，不重复派单）
   - `... --resolve skip` / `... --resolve abort`
