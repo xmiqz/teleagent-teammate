@@ -8,6 +8,9 @@
   TeleAgent 界面，默认零弹窗零响铃**；
 - 一切非完成态收敛为末行 `fallback_needed` 事件，携带可直接执行的
   处置命令 argv（续窗 / 断点续派 / 供应商故障转移 / 授权裁决）；
+- **进程退出即唤醒**：完成/异常都在一个轮询 tick 内收口退出；批次升级
+  默认以 rc3 退出上交（不常驻空等），调用方用 `--resolve` argv 处置后
+  即断点续跑；忙闲表残留有双确认兜底，不会"工程师做完了还在干等"；
 - 多工程师批次 playbook（并行派单 → 产物校验 → shell 验证 → 通知），
   崩溃断点续跑、进程守卫、开机自启；
 - 纯 Python 标准库、零三方依赖；Windows 为主，POSIX 尽力兼容。
@@ -55,7 +58,7 @@ python scripts/teammate.py run \
 
 ## 测试
 
-零联网冒烟（内置假 TeleAgent 服务，12 个场景）：
+零联网冒烟（内置假 TeleAgent 服务，16 个场景）：
 
 ```bash
 python tests/smoke_test.py

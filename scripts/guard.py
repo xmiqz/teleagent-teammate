@@ -4,9 +4,12 @@
 
 判定：
   1. state.json 为 complete/aborted      -> rc 0（终态，守卫应自退）
-  2. 批次 pid 不存活且非终态             -> 读 launch.json 无损重拉，rc 10
-  3. pid 存活但心跳陈旧（>heartbeat-min）-> rc 11（疑似僵尸/长阻塞，交 guard_loop 计数）
-  4. 一切正常                             -> rc 0
+  2. state.json 为 escalated             -> rc 0 awaiting_caller（调用方负总责：
+                                           进程升级即退是正常唤醒机制，绝不重拉，
+                                           调用方 --resolve 重拉后自动恢复监控）
+  3. 批次 pid 不存活且非终态/升级态       -> 读 launch.json 无损重拉，rc 10
+  4. pid 存活但心跳陈旧（>heartbeat-min）-> rc 11（疑似僵尸/长阻塞，交 guard_loop 计数）
+  5. 一切正常                             -> rc 0
 
 重拉依据 launch.json（由 batch.py 启动时写入）：python 可执行文件可能随
 TeleAgent 运行时轮换而变化，因此绝不硬编码 python 路径。
@@ -68,6 +71,13 @@ def check_once(sdir, heartbeat_min=60, log_path=None):
     status = state.get("status")
     if status in ("complete", "aborted"):
         return 0, {"terminal": status}
+    if status == "escalated":
+        # 默认 escalate-exit：批次进程此刻大概率已退出，这是等待调用方裁决
+        # 的正常驻停态。重拉会与调用方的 --resolve 重拉撞互斥量/形成空转，
+        # 因此只报告、不动进程；调用方续跑后心跳恢复，监控自动接续。
+        esc = state.get("escalation") or {}
+        return 0, {"awaiting_caller": True,
+                   "stage": esc.get("stage"), "reason": esc.get("reason")}
 
     hb = read_json(os.path.join(sdir, "heartbeat.json")) or {}
     pid = hb.get("pid")

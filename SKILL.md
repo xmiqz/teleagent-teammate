@@ -24,6 +24,15 @@ description: 把编码子任务分包给本机 TeleAgent 智能体并全程无�
 5. 脚本的自动动作只在白名单内（连接退避/自动拉起、401 密钥轮换重试、
    安全授权 session 放行、宽申首次 reject+纠偏、abort 自动重派 1 次）。
    其余一律结构化上交，脚本不替你做危险决策。
+6. **进程退出是唯一可靠的唤醒信号**。派单/批次必须在**同一次工具调用里
+   阻塞等待** run/batch 进程退出（前台超时工具会自动转后台，进程退出时
+   系统自动把你唤醒，无需轮询、无需用户）。严禁裸 dispatch 后结束回合、
+   严禁 sleep 轮询、严禁让用户"等好了叫你"。派给 Task 子智能体时，任务
+   描述必须写明"进程退出前不得结束你的回合"。
+7. **批次升级默认即退**。batch.py 阶段失败时默认输出末行 fallback_needed
+   后以 rc3 退出（就是为了唤醒阻塞中的你），不是崩溃。你场外处置后执行
+   事件 argv（`--resolve retry|skip|abort|redispatch:<key>`）即完成裁决
+   并断点续跑，然后继续阻塞等待。
 
 ## 1. 派单前检查点（30 秒，必做）
 
@@ -76,6 +85,12 @@ python scripts/teammate.py run ^
 | 4 | permission_required | 按第 4 节裁决后执行 reply argv，再 attach |
 | 6 | stalled | 先 prompt 注入推进 + attach；仍停滞则 abort+resume |
 | 1 | env_unavailable | doctor 自愈后 attach；会话已死则 resume |
+
+补充：完成判据是"忙闲表已清 + 末消息 step-finish=stop"；忙闲表清除
+滞后时连续两次相同 stop 签名也按 done 收口（done 事件带
+`busy_map_lag: true`），单次瞬态掉表不会误判 abort（连续两次同签名
+才判 rc3）。批次进程（batch.py）的 rc3 语义不同：表示批次 escalated
+等待你裁决续跑，见第 6 节。
 
 ## 3. fallback_needed 决策表（收到末行就照做）
 
@@ -176,17 +191,29 @@ playbook 要点（完整字段见 assets/playbook.example.json）：
 - 断点：每步落 state.json，崩溃重启从断点继续，sid 持久化不重复派单；
   会话 abort 自动重派 1 次（自动模型故障转移）；API 抖动 catch-all
   退避 60s 不崩。
-- 升级：阶段失败/超时/验证不过 → state=escalated 并结构化上报，
-  由你用 batch_ctl 裁决：
-  - `python scripts/batch_ctl.py status --state-dir orch\T1`
-  - `... resolve retry|skip|abort [--note 说明]`
+- 升级：阶段失败/超时/验证不过/两次中止 → state=escalated。**默认
+  escalate-exit**：批次输出末行 `fallback_needed`（含可直接执行的
+  `recommended_actions`）后以 **rc3 退出**，专门用来唤醒阻塞等待中的你；
+  你场外处置后执行事件 argv 即裁决+断点续跑，随后继续阻塞等待：
+  - `... batch.py --playbook pb.json --state-dir orch\T1 --resolve retry`
+    （只重试验证/等待，不重复派单）
+  - `... --resolve skip` / `... --resolve abort`
+  - `... --resolve redispatch:<agent_key>`（先自行 abort 旧 sid；作废
+    sid 重新派单，保留故障模型规避）
+  需要旧语义（升级后常驻等 batch_ctl，配合 --popup/人工在场）加
+  `--escalate-wait`；该标志会写入 launch.json 随守卫重拉保留。
+  状态查询（进程在/不在都能用）：
+  `python scripts/batch_ctl.py status --state-dir orch\T1`
 - Windows 命名互斥量保证每个 state-dir 硬单实例。
 
 保活（长时间批次跨进程重启）：
 
 - `python scripts/guard.py --state-dir orch\T1` 单轮巡检
   （GetExitCodeProcess 防僵尸误判；心跳超时先杀后拉，按 launch.json
-  无损重拉）。rc：0 健康/批次终态，10 已重拉，11 僵尸，12 重拉失败。
+  无损重拉）。rc：0 健康/批次终态/**escalated 等待调用方（不重拉）**，
+  10 已重拉，11 僵尸，12 重拉失败。守卫绝不在 escalated 状态重拉批次
+  （那会与你的 --resolve 续跑撞互斥量并形成空转）；你续跑后心跳恢复，
+  监控自动接续。
 - `python scripts/guard_loop.py --state-dir orch\T1`
   循环巡检（默认 180s，pythonw 静默常驻，批次终态自退；命名互斥量
   单实例）。开机自启：`--install-startup`（在用户 Startup 文件夹
@@ -208,7 +235,7 @@ SHA、文件域互斥、三凭证（python/runner/证据目录）、禁 commit/p
 ## 8. 自检与排障
 
 - 零三方依赖冒烟（内置假 TeleAgent 服务，不联网）：
-  `python tests/smoke_test.py`，应输出 12 个场景全过。
+  `python tests/smoke_test.py`，应输出 16 个场景全过。
 - 改任何 scripts 后必须重跑冒烟；真实链路用只读小任务验证
   （数文件、写 TEMP 标记文件），不要用真实推送测试。
 - 常见现象：dispatch 返回 204 但会话秒死 → 先看 messages 末条

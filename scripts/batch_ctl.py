@@ -108,7 +108,9 @@ def send_command(sdir, action, note):
     if not pid_alive(pid):
         print(json.dumps(
             {"event": "error", "detail": f"批次进程不存活 pid={pid}，"
-             "指令无法被消费；请先重启 batch.py（守卫会按 launch.json 自动重拉）"},
+             "指令无法被消费。escalated 状态请直接重拉并带裁决："
+             "python batch.py --playbook <pb> --state-dir <dir> "
+             "--resolve retry|skip|abort|redispatch:<key>（守卫不重拉升级态）"},
             ensure_ascii=False))
         return 2
     if action in ("retry", "skip") and state.get("status") != "escalated":

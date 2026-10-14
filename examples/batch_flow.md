@@ -29,7 +29,8 @@ python scripts/batch.py --playbook playbook.json --state-dir orch/EX
 python scripts/guard_loop.py --state-dir orch/EX
 ```
 
-180s 巡检一次：批次进程死了/僵尸了按 `orch/EX/launch.json` 无损重拉，
+180s 巡检一次：批次进程死了/僵尸了按 `orch/EX/launch.json` 无损重拉
+（escalated 驻停态除外——那是在等调用方 `--resolve`，重拉只会空转），
 批次进入终态后守卫自退。开机自启（零管理员）：
 
 ```
@@ -39,17 +40,31 @@ python scripts/guard_loop.py --state-dir orch/EX --uninstall-startup
 
 ## 4. 升级与裁决（调用方智能体通道，不找用户）
 
-阶段超时/验证不过/shell 失败 → state=escalated，批次暂停等你：
+阶段超时/验证不过/shell 失败/会话两次中止 → state=escalated。默认
+**escalate-exit**：批次输出末行 `fallback_needed` 后以 rc3 退出，用进程
+退出唤醒阻塞等待中的你（你本来就该在同一次工具调用里阻塞等它）。按末行
+`recommended_actions[].argv` 场外处置后，用 `--resolve` 重拉即裁决+断点
+续跑（sid 已持久化，不重复派单）：
+
+```
+# 只重试验证/等待（不重复派单）
+python scripts/batch.py --playbook playbook.json --state-dir orch/EX --resolve retry
+# 跳过当前阶段 / 终止批次
+python scripts/batch.py --playbook playbook.json --state-dir orch/EX --resolve skip
+python scripts/batch.py --playbook playbook.json --state-dir orch/EX --resolve abort
+# 会话两次中止/停滞：先 teammate.py abort 旧 sid，再作废 sid 重新派单
+python scripts/batch.py --playbook playbook.json --state-dir orch/EX --resolve redispatch:<agent_key>
+```
+
+随时可查状态（进程不存活时返回码 2，JSON 照读）：
 
 ```
 python scripts/batch_ctl.py status --state-dir orch/EX
-python scripts/batch_ctl.py resolve retry --state-dir orch/EX --note "环境抖动，重跑"
-python scripts/batch_ctl.py resolve skip  --state-dir orch/EX --note "该步骤本批次豁免"
-python scripts/batch_ctl.py resolve abort --state-dir orch/EX --note "放弃批次"
 ```
 
-`retry/skip` 仅在 escalated 时生效；批次进程不存活时 status 会提示
-先重启 batch.py（guard 也会自动重拉）。
+需要旧语义（升级后进程常驻、经 batch_ctl 指令通道裁决，配合 --popup/
+人工在场）时启动加 `--escalate-wait`；该标志写入 launch.json，守卫重拉
+会保留。无论哪种模式，guard 都**不会**重拉 escalated 状态的批次。
 
 ## 5. 红线复核（启动前逐条）
 

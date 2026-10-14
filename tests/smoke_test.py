@@ -13,6 +13,11 @@
   8. reply 404（授权已被消费）-> gone:404，任务照常完成
   9. resume --abort-old 带断点续派，新会话收到原任务书
  10. batch：dispatch_group + shell + notify 跑到 complete；guard 识别终态
+ 11. busy_map 残留（step-finish=stop 但 sid 仍在忙闲表）→ 双确认 done
+ 12. 忙闲表单轮瞬态掉表不得误判 abort，会话恢复后正常完成
+ 13. batch 升级即退 rc3（fallback_needed 带 --resolve argv）；
+     guard 不重拉 escalated；--resolve retry/skip 断点续跑到 complete；
+     --escalate-wait 旧语义升级常驻
 
 直接运行：python smoke_test.py；任一断言失败退出码 1。
 """
@@ -108,9 +113,25 @@ class FakeState:
         n = self.busy.get(sid, 0)
         if self.mode == "done_after_1":
             return n >= 1
-        if self.mode == "always_running":
-            return False
+        if self.mode in ("always_running", "stale_busy_done"):
+            return False if self.mode == "always_running" else n >= 2
+        if self.mode == "blip_then_done":
+            return n >= 4
         return n >= 2
+
+    def in_busy_status(self, sid):
+        """状态忙闲表是否含 sid（在 GET /message tick 之前调用）。"""
+        if sid in self.aborted:
+            return False
+        n = self.busy.get(sid, 0)
+        if self.mode == "stale_busy_done":
+            # 任务已 stop 但忙闲表永不清理：模拟 TeleAgent busy_map 残留
+            return True
+        if self.mode == "blip_then_done":
+            # 第 2 轮瞬态掉表（消息还只是 assistant 文本），第 3 轮恢复忙，
+            # 第 4 轮真正完成——双确认必须能挡住这次假 abort
+            return n not in (2,) and n < 4
+        return not self.is_done_poll(sid)
 
     def messages(self, sid):
         if sid in self.aborted:
@@ -129,6 +150,18 @@ class FakeState:
                         "error": {"name": "UnknownError", "data": {
                             "message": 'create chat model: provider "GhostCorp" not found'}}},
                      "parts": []}]
+        if self.mode == "blip_then_done":
+            n = self.busy.get(sid, 0)  # 本轮 GET /message 已 tick
+            if n == 3:
+                return [{"info": {"role": "assistant"}, "parts": [
+                    {"type": "text", "text": "halfway text, no finish yet"}]}]
+            if n >= 5:
+                return [{"info": {"role": "assistant"}, "parts": [
+                    {"type": "text", "text": "TASK_ANSWER_MARKER 全部完成"},
+                    {"type": "step-finish", "reason": "stop"}]}]
+            return [{"info": {"role": "assistant"}, "parts": [
+                {"type": "tool", "state": {"status": "running"}},
+                {"type": "text", "text": "working..."}]}]
         if self.is_done_poll(sid):
             return [{"info": {"role": "assistant"}, "parts": [
                 {"type": "text", "text": "TASK_ANSWER_MARKER 全部完成"},
@@ -184,10 +217,10 @@ class Handler(BaseHTTPRequestHandler):
                          "env": ["GHOST_API_KEY"],
                          "models": {"ghost": {"capabilities": {"toolcall": True}}}}]})
             if p == "/session/status":
-                # 已中止/已到完成轮次的 sid 移出忙闲表，其余视为 busy
+                # 忙闲表是否残留由 FakeState.in_busy_status 决定
+                # （覆盖正常完成、busy_map 残留、瞬态掉表等场景）
                 return self._send(200, {
-                    s: {} for s in STATE.busy
-                    if s not in STATE.aborted and not STATE.is_done_poll(s)})
+                    s: {} for s in STATE.busy if STATE.in_busy_status(s)})
             if p == "/permission":
                 return self._send(200, list(STATE.permissions))
             if p == "/session":
@@ -536,6 +569,173 @@ def test_batch_and_guard(wa):
     print("[ok] batch dispatch_group+shell+notify complete，guard/ctl 正常")
 
 
+def _batch_playbook(wa, marker, outf, tag):
+    pf = wa.path("task-%s.md" % tag)
+    with open(pf, "w", encoding="utf-8") as f:
+        f.write("批次任务，完成后写结论 TASK_ANSWER_MARKER")
+    return {
+        "batch": "smoke-batch-%s" % tag, "window": 4,
+        "roots": {"workspace": [wa.ws], "allow": [wa.ws]},
+        "stages": [
+            {"id": "g", "type": "dispatch_group", "timeout": 120, "agents": [
+                {"key": "a", "title": "batch-agent-%s" % tag,
+                 "directory": wa.ws, "prompt_file": pf,
+                 "output_file": outf,
+                 "verify": {"files_exist": [marker]}}]},
+            {"id": "sh", "type": "shell", "steps": [
+                {"argv": [PY, "-c", "print('BATCH_SHELL_MARKER')"],
+                 "stdout_contains": ["BATCH_SHELL_MARKER"]}]},
+            {"id": "note", "type": "notify",
+             "title": "smoke", "message": "batch done"}],
+    }
+
+
+def run_batch(wa, pb_path, sdir, *extra, timeout=90):
+    p = subprocess.run([PY, os.path.join(SCRIPTS, "batch.py"),
+                        "--playbook", pb_path, "--state-dir", sdir, *extra],
+                       env=wa.env, capture_output=True, text=True,
+                       timeout=timeout, encoding="utf-8", errors="replace")
+    lines = [json.loads(x) for x in p.stdout.splitlines()
+             if x.strip().startswith("{")]
+    return p.returncode, lines, p.stdout, p.stderr
+
+
+def _guard_once(wa, sdir):
+    g = subprocess.run([PY, os.path.join(SCRIPTS, "guard.py"),
+                        "--state-dir", sdir], env=wa.env,
+                       capture_output=True, text=True)
+    return g.returncode, json.loads(g.stdout)
+
+
+def _wait_state(sdir, status, timeout=60):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            st = json.load(open(os.path.join(sdir, "state.json"),
+                                encoding="utf-8"))
+            if st.get("status") == status:
+                return st
+        except (OSError, ValueError):
+            pass
+        time.sleep(1)
+    raise AssertionError("state-dir 未在 %ds 内进入 %s" % (timeout, status))
+
+
+def test_run_stale_busy_done(wa):
+    reset_state("stale_busy_done")
+    pf = wa.path("task-stale.md")
+    with open(pf, "w", encoding="utf-8") as f:
+        f.write("忙闲表残留任务")
+    rc, lines, out, err = run_cli(
+        wa, "run", "--title", "smoke-stale-busy", "--prompt-file", pf,
+        "--directory", wa.ws, "--timeout", "60", "--window", "8",
+        "--interval", "1", "--workspace", wa.ws, "--allow", wa.ws)
+    assert rc == 0, "busy_map 残留但已 stop 必须按 done 收口：\n%s\n%s" % (
+        out, err)
+    ev = last_event(lines, "done")
+    assert ev and ev.get("busy_map_lag") is True, ev
+    print("[ok] busy_map 残留（stop 仍 busy）双确认后 rc0，不再干等")
+
+
+def test_run_abort_blip(wa):
+    reset_state("blip_then_done")
+    pf = wa.path("task-blip.md")
+    with open(pf, "w", encoding="utf-8") as f:
+        f.write("瞬态掉表任务")
+    rc, lines, out, err = run_cli(
+        wa, "run", "--title", "smoke-blip", "--prompt-file", pf,
+        "--directory", wa.ws, "--timeout", "60", "--window", "8",
+        "--interval", "1", "--workspace", wa.ws, "--allow", wa.ws)
+    assert rc == 0, "单轮瞬态掉表不得误判 abort：\n%s\n%s" % (out, err)
+    assert last_event(lines, "done"), "会话恢复后应正常完成"
+    assert not any(ev.get("event") in ("aborted", "error") for ev in lines)
+    print("[ok] 忙闲表单轮瞬态掉表被双确认挡住，恢复后正常完成")
+
+
+def test_batch_escalate_exit_resolve(wa):
+    reset_state("done_after_1")
+    marker = wa.path("marker-exit.txt")
+    outf = wa.path("result-exit.md")
+    pb = _batch_playbook(wa, marker, outf, "exit")
+    pb_path = wa.path("playbook-exit.json")
+    sdir = wa.path("orch-exit")
+    with open(pb_path, "w", encoding="utf-8") as f:
+        json.dump(pb, f, ensure_ascii=False)
+
+    # 缺产物 -> 验证不过 -> 默认 escalate-exit：进程必须退出 rc3 唤醒调用方
+    rc, lines, out, err = run_batch(wa, pb_path, sdir)
+    assert rc == 3, "默认升级即退 rc3：\n%s\n%s" % (out, err)
+    fb = lines[-1]
+    assert fb.get("event") == "fallback_needed" and fb.get("escalated_exit")
+    assert "收割验证未过" in fb.get("reason", "")
+    assert all("--resolve" in " ".join(a["argv"])
+               for a in fb["recommended_actions"]), fb
+    state = json.load(open(os.path.join(sdir, "state.json"), encoding="utf-8"))
+    assert state["status"] == "escalated"
+
+    # 守卫对升级态（进程已死）只报告、绝不重拉
+    grc, ginfo = _guard_once(wa, sdir)
+    assert grc == 0 and ginfo.get("awaiting_caller") is True, ginfo
+    assert "restarted" not in ginfo, "升级态禁止重拉：%s" % ginfo
+
+    # 调用方场外补齐产物，执行 retry argv 续跑 -> complete
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write("fixed")
+    rc, lines, out, err = run_batch(wa, pb_path, sdir, "--resolve", "retry")
+    assert rc == 0, "--resolve retry 应续跑到 complete：\n%s\n%s" % (
+        out, err)
+    state = json.load(open(os.path.join(sdir, "state.json"), encoding="utf-8"))
+    assert state["status"] == "complete", state
+    launch = json.load(open(os.path.join(sdir, "launch.json"),
+                            encoding="utf-8"))
+    assert "--resolve" not in launch["argv"], "一次性裁决不得进 launch.json"
+    assert "--escalate-wait" not in launch["argv"]
+    assert any(ev.get("event") == "RESOLVED" for ev in lines)
+    print("[ok] batch 验证失败升级即退 rc3；guard 不重拉；--resolve retry 续跑 complete")
+
+
+def test_batch_escalate_wait_and_skip(wa):
+    reset_state("done_after_1")
+    marker = wa.path("marker-wait.txt")
+    outf = wa.path("result-wait.md")
+    pb = _batch_playbook(wa, marker, outf, "wait")
+    pb_path = wa.path("playbook-wait.json")
+    sdir = wa.path("orch-wait")
+    with open(pb_path, "w", encoding="utf-8") as f:
+        json.dump(pb, f, ensure_ascii=False)
+
+    # --escalate-wait：升级后进程必须常驻（旧语义，配合弹窗/守卫）
+    proc = subprocess.Popen(
+        [PY, os.path.join(SCRIPTS, "batch.py"), "--playbook", pb_path,
+         "--state-dir", sdir, "--escalate-wait"],
+        env=wa.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace")
+    try:
+        _wait_state(sdir, "escalated")
+        time.sleep(2)
+        assert proc.poll() is None, "escalate-wait 模式升级后不得退出"
+        launch = json.load(open(os.path.join(sdir, "launch.json"),
+                                encoding="utf-8"))
+        assert "--escalate-wait" in launch["argv"], launch
+    finally:
+        proc.kill()
+        proc.wait(timeout=20)
+
+    # 即使进程已死，guard 对 escalated 仍然只报告不重拉
+    grc, ginfo = _guard_once(wa, sdir)
+    assert grc == 0 and ginfo.get("awaiting_caller") is True, ginfo
+    assert "restarted" not in ginfo
+
+    # 调用方决定跳过该阶段：--resolve skip 续跑 -> complete
+    rc, lines, out, err = run_batch(wa, pb_path, sdir, "--resolve", "skip")
+    assert rc == 0, "--resolve skip 应续跑到 complete：\n%s\n%s" % (
+        out, err)
+    state = json.load(open(os.path.join(sdir, "state.json"), encoding="utf-8"))
+    assert state["status"] == "complete"
+    assert state["stages"]["g"]["state"] == "skipped"
+    print("[ok] --escalate-wait 升级常驻；死进程不被守卫重拉；--resolve skip 续跑 complete")
+
+
 def main():
     httpd = serve()
     port = httpd.server_address[1]
@@ -545,6 +745,8 @@ def main():
         test_run_aborted, test_run_model_fault, test_run_stalled, test_run_permission_manual,
         test_run_permission_broad, test_run_permission_404,
         test_resume, test_batch_and_guard,
+        test_run_stale_busy_done, test_run_abort_blip,
+        test_batch_escalate_exit_resolve, test_batch_escalate_wait_and_skip,
     ]
     failed = 0
     for fn in cases:

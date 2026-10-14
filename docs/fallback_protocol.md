@@ -58,3 +58,23 @@
 
 除此之外的一切异常（真越界授权、供应商错误、停滞、现场损坏、阶段失败、
 环境长期不可用）都必须结构化上交，脚本不替调用方做危险决策。
+
+## 唤醒协议（反干等）
+
+"工程师做完了、调用方还在干等"的根因是脚本完成/升级后没有东西唤醒
+阻塞中的调用方。本技能的约定：
+
+1. **进程退出是唯一可靠的唤醒信号**。调用方必须在同一次工具调用中阻塞
+   等待 run/attach/resume/batch 进程退出，不允许派单后结束回合、sleep
+   轮询或把用户当通知通道。
+2. 单会话看守在一个 tick（默认 5s）内识别终态并退出：done → rc0；
+   busy_map 清除滞后（step-finish=stop 但 sid 仍在忙闲表）时连续两次
+   相同签名即按 done 收口（事件带 `busy_map_lag: true`）；busy 瞬态
+   掉表的单次采样不判 abort，连续两次同签名才 rc3，避免误触发重派。
+3. batch.py 成功 → rc0；**任何阶段升级默认 escalate-exit → rc3**，
+   末行 `fallback_needed`（`escalated_exit: true`，argv 为
+   `batch.py --resolve retry|skip|abort|redispatch:<key>` 的重拉命令）。
+   调用方场外处置后执行该 argv，进程应用裁决并从断点续跑。
+   `--escalate-wait` 保留"升级常驻 + batch_ctl 指令通道"旧语义。
+4. guard/guard_loop 视 escalated 为 `awaiting_caller`（rc0），**绝不
+   重拉**；调用方续跑后心跳恢复，监控自动接续。

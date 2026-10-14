@@ -58,6 +58,11 @@ class Batch:
         self.hb_path = os.path.join(self.sdir, "heartbeat.json")
         self.log_path = os.path.join(self.sdir, "logs", "batch.jsonl")
         self.popup = bool(getattr(args, "popup", False))
+        # 默认 escalate-exit：升级即退 rc3，末行 fallback_needed 唤醒阻塞中的
+        # 调用方（进程退出是唯一可靠唤醒信号）；调用方处置后用 --resolve 重拉。
+        # --escalate-wait 保留旧语义（常驻等 batch_ctl，配合 --popup/守卫）。
+        self.escalate_wait = bool(getattr(args, "escalate_wait", False))
+        self.boot_resolve_action = getattr(args, "resolve", None)
         self.python = sys.executable
         self.window = int(self.pb.get("window", 45))
 
@@ -82,8 +87,11 @@ class Batch:
         launch = {
             "python": sys.executable,
             "script": os.path.join(HERE, "batch.py"),
+            # --escalate-wait 必须随守卫重拉保留；--resolve 是一次性场外裁决，
+            # 绝不能进 launch（否则每次重拉都把旧裁决再应用一遍）
             "argv": ["--playbook", os.path.abspath(args.playbook),
                      "--state-dir", os.path.abspath(args.state_dir)]
+                    + (["--escalate-wait"] if self.escalate_wait else [])
                     + (["--popup"] if self.popup else []),
             "ts": now(),
         }
@@ -169,19 +177,50 @@ class Batch:
             argv += ["--note", note]
         return argv
 
-    def escalate(self, stage_id, reason, detail=""):
-        with self.lock:
-            if self.state.get("escalation"):
-                return
-            # 调用方智能体负总责：默认零弹窗，只留结构化事件与状态文件
-            actions = [
+    def _resume_argv(self, resolve):
+        """场外处置后一条命令完成裁决+断点续跑（进程已退场景）。"""
+        argv = [sys.executable, os.path.join(HERE, "batch.py"),
+                "--playbook", self.playbook_path,
+                "--state-dir", os.path.abspath(self.sdir)]
+        if self.escalate_wait:
+            argv.append("--escalate-wait")
+        argv += ["--resolve", resolve]
+        return argv
+
+    def escalation_actions(self, key=None):
+        if self.escalate_wait:
+            # 旧语义：进程常驻，调用方经 commands.jsonl 通道裁决
+            return [
                 {"label": "重试该阶段（仅重试验证/等待，不重复派单）",
                  "argv": self._ctl_argv("retry")},
                 {"label": "跳过该阶段", "argv": self._ctl_argv("skip")},
                 {"label": "终止整个批次", "argv": self._ctl_argv("abort")},
-                {"label": "人工/调用方自行场外处置（abort 会话+新会话）后再 retry",
+                {"label": "自行场外处置（abort 会话+新会话）后再 retry",
                  "argv": self._ctl_argv("retry", "场外处理完成")},
             ]
+        # 默认语义：本进程升级即退 rc3 唤醒调用方；下列 argv 完成裁决并续跑
+        actions = [
+            {"label": "场外处置后续跑（先自行修正，再执行本命令，"
+                      "只重试验证/等待，不重复派单）",
+             "argv": self._resume_argv("retry")},
+            {"label": "跳过当前阶段，继续后续阶段",
+             "argv": self._resume_argv("skip")},
+            {"label": "终止整个批次",
+             "argv": self._resume_argv("abort")},
+        ]
+        if key:
+            actions.insert(0, {
+                "label": "先 teammate.py abort 旧会话（sid 见 state.json），"
+                         "再执行本命令：作废 sid 重新派单（保留故障模型规避）后续跑",
+                "argv": self._resume_argv("redispatch:%s" % key)})
+        return actions
+
+    def escalate(self, stage_id, reason, detail="", key=None):
+        with self.lock:
+            if self.state.get("escalation"):
+                return
+            # 调用方智能体负总责：默认零弹窗，只留结构化事件与状态文件
+            actions = self.escalation_actions(key)
             self.state["escalation"] = {
                 "stage": stage_id, "reason": reason,
                 "detail": str(detail)[:800], "ts": now(),
@@ -198,6 +237,55 @@ class Batch:
                            f"批次 {self.state['batch']} 阶段 {stage_id}\n"
                            f"{str(detail)[:500]}\n"
                            "用 batch_ctl.py retry/skip/abort 处置。")
+
+    def apply_resolution(self, action):
+        """统一裁决状态机：活进程（batch_ctl 指令）与进程已退（--resolve 重拉）
+        共用，两条路径语义必须完全一致。"""
+        key = None
+        if action.startswith("redispatch:"):
+            key = action.split(":", 1)[1]
+            action = "redispatch"
+        if action == "abort":
+            self.state["status"] = "aborted"
+            self.state["escalation"] = None
+            self._save_state()
+            return
+        sid = (self.state.get("escalation") or {}).get("stage")
+        valid = {s["id"] for s in self.pb["stages"]}
+        if action == "redispatch":
+            stage = next((s for s in self.pb["stages"]
+                          if s["id"] == sid), None)
+            keys = {a["key"] for a in (stage or {}).get("agents", [])}
+            if sid not in valid or key not in keys:
+                raise ValueError(
+                    f"redispatch 目标非法：stage={sid} key={key}")
+            stg = self.state["stages"].setdefault(sid, {"state": "pending"})
+            # 作废旧 sid/模型记录，强制下一轮重新派单；avoid_ 保留以继续
+            # 规避故障模型；redispatch 计数清零给新会话完整重试额度
+            for p in (f"sid_{key}", f"model_{key}", f"sig_{key}",
+                      f"sig_since_{key}", f"redispatch_{key}"):
+                stg.pop(p, None)
+            finished = stg.get("finished_agents")
+            if isinstance(finished, list) and key in finished:
+                finished.remove(key)
+            stg["state"] = "pending"
+            stg.pop("started", None)
+            stg.pop("fail", None)
+        elif sid in valid and action in ("retry", "skip"):
+            stg = self.state["stages"].get(sid, {"state": "pending"})
+            if action == "retry":
+                stg["state"] = "pending"
+                stg.pop("started", None)
+                # 已派会话的 sid 保留：retry 只重试验证/等待，不重复派单；
+                # 需要重派用 redispatch:<key>
+                stg.pop("fail", None)
+            else:
+                stg["state"] = "skipped"
+                stg["finished"] = now()
+            self.state["stages"][sid] = stg
+        self.state["escalation"] = None
+        self.state["status"] = "running"
+        self._save_state()
 
     def maybe_realert(self):
         """升级态每 15 分钟重弹，漏接一次弹窗不等于永久停工。"""
@@ -247,31 +335,12 @@ class Batch:
 
     def _apply_command(self, cmd):
         act = cmd.get("action")
-        esc = self.state.get("escalation")
         self.emit("COMMAND", action=act, note=cmd.get("note", ""))
-        if act == "abort":
-            self.state["status"] = "aborted"
-            self.state["escalation"] = None
-            self._save_state()
+        if act not in ("abort", "retry", "skip"):
             return
-        if act in ("retry", "skip") and esc:
-            sid = esc["stage"]
-            valid = {s["id"] for s in self.pb["stages"]}
-            if sid in valid:
-                stg = self.state["stages"].get(sid, {"state": "pending"})
-                if act == "retry":
-                    stg["state"] = "pending"
-                    stg.pop("started", None)
-                    # 已派会话的 sid 保留：retry 只重试验证/等待，不重复派单；
-                    # 需要重派由调用方场外处理（abort+新会话）后再 retry
-                    stg.pop("fail", None)
-                else:
-                    stg["state"] = "skipped"
-                    stg["finished"] = now()
-                self.state["stages"][sid] = stg
-            self.state["escalation"] = None
-            self.state["status"] = "running"
-            self._save_state()
+        if act != "abort" and not self.state.get("escalation"):
+            return
+        self.apply_resolution(act)
 
     # ---------------- 授权 ----------------
 
@@ -378,7 +447,8 @@ class Batch:
                 self._save_state()
             elif rc == 6:
                 self.escalate(stage["id"],
-                              f"会话停滞：{a['key']}（{stall}s 零增长）", sid)
+                              f"会话停滞：{a['key']}（{stall}s 零增长）", sid,
+                              key=a["key"])
                 return False
             elif rc in (3, 1):
                 # abort 自动重派一次（连接抖动/秒死占多数），第二次才升级
@@ -394,7 +464,8 @@ class Batch:
                               avoid_model=st[f"avoid_{a['key']}"])
                     return None
                 self.escalate(stage["id"],
-                              f"TeleAgent 会话两次中止：{a['key']}", sid)
+                              f"TeleAgent 会话两次中止：{a['key']}", sid,
+                              key=a["key"])
                 return False
         if time.time() > deadline and len(finished) < len(agents):
             self.escalate(stage["id"], "阶段超时",
@@ -576,10 +647,31 @@ class Batch:
                 self.emit("PERM_LOOP_ERROR", error=str(e)[:300])
             time.sleep(5)
 
+    def boot_resolve(self):
+        """进程已退场景的场外裁决：--resolve retry|skip|abort|redispatch:<key>
+        在主循环开始前一次性应用，随后从断点继续。"""
+        action = self.boot_resolve_action
+        if not action:
+            return
+        if self.state.get("status") != "escalated":
+            self.emit("RESOLVE_IGNORED", action=action,
+                      current_status=self.state.get("status"),
+                      note="只有 escalated 状态接受裁决")
+            return
+        try:
+            self.apply_resolution(action)
+        except Exception as e:
+            self.emit("RESOLVE_BAD", action=action,
+                      error=f"{type(e).__name__}: {e}"[:300])
+            return
+        self.emit("RESOLVED", action=action)
+
     def run(self):
         self.emit("BATCH_START", batch=self.state["batch"],
                   stages=[s["id"] for s in self.pb["stages"]],
-                  python=self.python, playbook=self.playbook_path)
+                  python=self.python, playbook=self.playbook_path,
+                  escalate_mode=("wait" if self.escalate_wait else "exit"))
+        self.boot_resolve()
         pt = threading.Thread(target=self.permission_thread, daemon=True)
         pt.start()
         while True:
@@ -601,9 +693,24 @@ class Batch:
             self.heartbeat(stage["id"], self.state["status"])
 
             if self.state["status"] == "escalated":
-                self.maybe_realert()
-                time.sleep(15)
-                continue
+                if self.escalate_wait:
+                    self.maybe_realert()
+                    time.sleep(15)
+                    continue
+                # 默认 escalate-exit：末行 fallback_needed 后立即退出 rc3。
+                # 进程退出是阻塞等待中调用方的唯一可靠唤醒信号（无弹窗、无
+                # 用户）；调用方执行末行 argv 即完成裁决并从断点续跑。
+                esc = self.state.get("escalation") or {}
+                self.emit("BATCH_ESCALATED_EXIT", event="fallback_needed",
+                          escalated_exit=True,
+                          reason=esc.get("reason"), stage=esc.get("stage"),
+                          detail=esc.get("detail"), blocking=True,
+                          recommended_actions=esc.get(
+                              "recommended_actions") or self.escalation_actions(),
+                          state_dir=os.path.abspath(self.sdir),
+                          hint="处置后执行 recommended_actions 的 argv 即续跑；"
+                               "guard 不会重拉 escalated 状态")
+                return 3
 
             try:
                 typ = stage["type"]
@@ -636,6 +743,12 @@ def main():
     ap.add_argument("--state-dir", required=True)
     ap.add_argument("--popup", action="store_true",
                     help="启用响铃+弹窗；默认零打扰，异常只写事件与状态文件")
+    ap.add_argument("--escalate-wait", action="store_true",
+                    help="升级后进程常驻等 batch_ctl 裁决（旧语义，配合 "
+                         "--popup/守卫）；默认升级即退 rc3 唤醒调用方")
+    ap.add_argument("--resolve", default=None, metavar="ACTION",
+                    help="一次性场外裁决（进程已退时）：retry|skip|abort|"
+                         "redispatch:<agent_key>；应用后从断点续跑")
     args = ap.parse_args()
     sys.exit(Batch(args).run())
 

@@ -672,8 +672,8 @@ def analyze_session(client, sid):
         else:
             state = "pending"
 
-    answer = "\n".join(t for t in last_texts if t.strip()).strip() \
-        if state == "done" else None
+    # answer 无条件计算：busy_map 残留时也要靠它构造 done 终态
+    answer = "\n".join(t for t in last_texts if t.strip()).strip()
     error_texts = [
         t for t in last_texts
         if any(pat in t.lower() for pat in ERROR_PATTERNS)]
@@ -796,6 +796,8 @@ def wait_window(client, sid, window, interval=5, start=None,
     last_state = None
     last_emit = 0.0
     last_info = None
+    # 终态候选 + 签名：瞬态防护（见循环内两处用法）
+    term_candidate = None
     while True:
         elapsed = time.time() - start
         if elapsed > window:
@@ -859,8 +861,35 @@ def wait_window(client, sid, window, interval=5, start=None,
             if verdict:
                 return verdict
         term = terminal_event(sid, info, elapsed)
-        if term:
+        if term and term[1] == 0:
+            # done（busy 已清 + step-finish=stop）：权威终态，一个 tick 内收口
             return term[1], term[0]
+        if term and term[1] == 3:
+            # busy 已清但 finish=error/aborted 可能是模型轮次间隙的瞬态采样：
+            # 连续两次同签名才判死，防止把"刚好做到一半"误判 abort 触发重派
+            sig = (info["state"], info["messages"],
+                   info["finish_reason"], info["last_role"])
+            if term_candidate and term_candidate[0] == sig:
+                return term[1], term[0]
+            term_candidate = (sig, "abort")
+        elif (info.get("busy") and info.get("finish_reason") == "stop"
+              and not any(t.get("status") in ("running", "pending")
+                          for t in (info.get("tools") or []))):
+            # busy_map 残留防护：step-finish=stop、无在途工具，但 sid 仍在
+            # 忙闲表里（TeleAgent 清表滞后）。连续两次同签名即按 done 收口，
+            # 否则调用方会一直干等到超时
+            sig = ("stale_done", info["messages"], info["finish_reason"],
+                   len(info.get("tools") or []))
+            if term_candidate and term_candidate[0] == sig:
+                fixed = dict(info)
+                fixed["state"] = "done"
+                fixed["busy"] = False
+                done_event, _rc = terminal_event(sid, fixed, elapsed)
+                done_event["busy_map_lag"] = True
+                return 0, done_event
+            term_candidate = (sig, "stale_done")
+        else:
+            term_candidate = None
         time.sleep(interval)
 
 
